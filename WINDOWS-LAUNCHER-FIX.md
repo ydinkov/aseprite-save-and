@@ -1,1 +1,0 @@
-Temporary marker for the Windows launcher fix. This file will be removed in the same patch commit.
