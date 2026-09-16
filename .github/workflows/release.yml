@@ -35,7 +35,7 @@ jobs:
       - name: Validate Lua syntax
         run: luac5.4 -p save-hooks.lua
 
-      - name: Validate release version
+      - name: Validate tag version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
@@ -52,6 +52,7 @@ jobs:
         shell: bash
         run: |
           version="$(jq -r '.version' package.json)"
+          tag="v${version}"
           asset="aseprite-save-and-${version}.aseprite-extension"
 
           mkdir -p dist/package
@@ -63,6 +64,8 @@ jobs:
           )
 
           rm -rf dist/package
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
@@ -72,24 +75,21 @@ jobs:
           path: dist/${{ steps.package.outputs.asset }}
           if-no-files-found: error
 
-      - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish GitHub release
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_ASSET: ${{ steps.package.outputs.asset }}
         shell: bash
         run: |
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" \
-              --title "Aseprite Save & Run $GITHUB_REF_NAME" \
-              --generate-notes
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; leaving it unchanged."
+            exit 0
           fi
 
-      - name: Upload extension to GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          gh release upload "$GITHUB_REF_NAME" \
-            "dist/${{ steps.package.outputs.asset }}" \
-            --clobber
+          gh release create "$RELEASE_TAG" \
+            "dist/${RELEASE_ASSET}#Aseprite Save & Run extension" \
+            --target "$GITHUB_SHA" \
+            --title "Aseprite Save & Run $RELEASE_TAG" \
+            --generate-notes
