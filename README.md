@@ -1,101 +1,106 @@
-# Aseprite Save Hooks
+# Aseprite Save & Run
 
-Run configurable terminal commands automatically after you save a sprite in Aseprite.
+An Aseprite extension that runs a shell script after configurable save and export actions.
 
-Aseprite Save Hooks adds **File → Scripts → Save Hooks** with:
+## Features
 
-- **Settings...** — configure the ordered command list.
-- **Run Now** — execute the configured commands without saving first.
-- **Enabled** — globally enable or disable automatic save hooks.
-
-The extension listens for Aseprite's `SaveFile` and `SaveFileAs` commands and runs hooks after a successful save. `SaveFileCopyAs` / Export is intentionally not treated as a normal save.
+- Pick a script from the extension settings UI.
+- Pass optional arguments to the script.
+- Choose exactly which actions trigger it:
+  - Save
+  - Save As
+  - Save All (provided by the extension)
+  - Export / Save Copy As
+  - Export Sprite Sheet
+  - Export Tileset
+  - Repeat Last Export
+  - Save Selection
+  - Save Palette
+- Run the script manually from **File → Scripts → Save & Run → Run Script Now**.
+- Optionally run the script with the active sprite directory as the working directory.
+- Use sprite and hook variables in the script arguments.
+- Build an installable `.aseprite-extension` package in GitHub Actions.
+- Publish the package as a GitHub Release asset for `v*` tags.
 
 ## Install
 
-Download `aseprite-save-hooks.aseprite-extension` from the latest GitHub Release, then either:
+Download `aseprite-save-and-<version>.aseprite-extension` from the latest GitHub Release, then install it in Aseprite via:
 
-1. Double-click the file on Windows or macOS, or
-2. In Aseprite, open **Edit → Preferences → Extensions → Add Extension** and select it.
+**Edit → Preferences → Extensions → Add Extension**
 
-Restart Aseprite after installation if needed.
+Restart Aseprite after installing or updating the extension.
 
 ## Configure
 
-Open **File → Scripts → Save Hooks → Settings...**.
+Open:
 
-Each command can be enabled or disabled independently. Commands run from top to bottom. By default the extension:
+**File → Scripts → Save & Run → Settings...**
 
-- runs commands from the saved sprite's directory;
-- stops when a command fails;
-- shows an alert when a command exits unsuccessfully.
+Choose a shell script, enter any optional arguments, and enable the hooks you want.
 
-Aseprite asks for permission before a script is allowed to execute external commands through `os.execute()`.
+The script picker accepts any file. Save & Run uses the file extension to choose a sensible launcher for common shell script formats:
 
-### Variables
+- `.sh` / `.command` → `sh` on macOS/Linux
+- `.bash` → `bash`
+- `.bat` / `.cmd` → `call` on Windows
+- `.ps1` → Windows PowerShell on Windows, `pwsh` on macOS/Linux
+- other files are executed directly
 
-Commands support these variables:
+Aseprite will ask for permission when a script first tries to execute an external command through `os.execute()`.
+
+## Argument variables
+
+Arguments can contain these variables:
 
 | Variable | Value |
 | --- | --- |
-| `{file}` | Full path to the saved sprite |
-| `{dir}` | Directory containing the sprite |
+| `{file}` | Full sprite filename |
+| `{dir}` | Sprite directory |
 | `{name}` | Filename without extension |
 | `{filename}` | Filename including extension |
-| `{ext}` | File extension without the dot |
-| `{qfile}` | Shell-quoted `{file}` |
-| `{qdir}` | Shell-quoted `{dir}` |
-| `{qname}` | Shell-quoted `{name}` |
-| `{qfilename}` | Shell-quoted `{filename}` |
-| `{qext}` | Shell-quoted `{ext}` |
+| `{ext}` | File extension |
+| `{hook}` | Save & Run hook key, e.g. `save`, `export`, `saveAll` |
+| `{command}` | Aseprite command name, e.g. `SaveFile`, `ExportSpriteSheet` |
 
-Prefer the `q*` variants when passing paths as command-line arguments.
+Quoted variants are available as `{qfile}`, `{qdir}`, `{qname}`, `{qfilename}`, `{qext}`, `{qhook}`, and `{qcommand}`. Prefer quoted variants when passing paths as arguments.
 
-### Examples
-
-Export or process the saved sprite with Python:
+Example:
 
 ```text
-python ./tools/process_sprite.py {qfile}
+--sprite {qfile} --event {qhook}
 ```
 
-Run a project-local build script:
+## Save All
+
+Aseprite currently does not expose a native Save All command. The extension therefore adds **File → Scripts → Save & Run → Save All**. It saves every modified sprite that already has an associated file, skips never-saved sprites, then runs the Save All hook once if enabled.
+
+## Export hooks
+
+Aseprite exposes `beforecommand` and `aftercommand` events, but export-style commands do not provide a success/cancel result to extension code. Save & Run therefore executes enabled export hooks after the corresponding command returns. Save and Save As receive extra checks to avoid running after an obviously cancelled save.
+
+## Development
+
+The extension consists of:
 
 ```text
-./build-assets.sh {qfile}
+package.json
+save-hooks.lua
+LICENSE
+.github/workflows/release.yml
 ```
 
-On Windows:
+The GitHub Actions workflow validates the manifest, syntax-checks the Lua source, and builds the extension on pushes and pull requests.
 
-```text
-powershell -File .\\tools\\build-assets.ps1 -Sprite {qfile}
-```
+## Release
 
-## Notes
-
-`os.execute()` is synchronous. A long-running command will keep Aseprite busy until the command exits. For heavier pipelines, use a command that starts or signals a separate worker process.
-
-The extension intentionally runs arbitrary shell commands because that is its purpose. Only configure commands you trust.
-
-## Building locally
-
-An Aseprite extension is a ZIP archive with an `.aseprite-extension` filename. From the repository root:
+Update the version in `package.json`, then push a matching tag:
 
 ```bash
-mkdir -p dist
-zip -j dist/aseprite-save-hooks.aseprite-extension package.json save-hooks.lua LICENSE
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-## Releasing
-
-The GitHub Actions workflow validates the Lua syntax and `package.json`, builds the extension on pushes and pull requests, and uploads it as a workflow artifact.
-
-To create a GitHub Release:
-
-1. Update the version in `package.json`, e.g. `0.2.0`.
-2. Commit and push the change to `main`.
-3. Create and push a matching tag, e.g. `v0.2.0`.
-
-The workflow verifies that the tag and manifest versions match, then creates the release and attaches `aseprite-save-hooks.aseprite-extension`.
+The workflow verifies the tag matches `package.json`, builds the extension, creates the GitHub Release if needed, and uploads the `.aseprite-extension` file as a release asset.
 
 ## License
 
