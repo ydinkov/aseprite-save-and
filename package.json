@@ -2,7 +2,7 @@
   "name": "aseprite-save-hooks",
   "displayName": "Aseprite Save & Run",
   "description": "Run a selected shell script after configurable save and export actions in Aseprite.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "Yasen Dinkov",
     "url": "https://github.com/ydinkov"
