@@ -1,12 +1,27 @@
-local saveListener = nil
-local beforeSaveListener = nil
+local afterCommandListener = nil
+local beforeCommandListener = nil
 local running = false
-local pendingSave = nil
+local suppressHooks = false
+local pendingCommand = nil
 
-local DEFAULT_COMMAND = {
-  enabled = true,
-  command = ""
+local TRIGGERS = {
+  { key = "save", label = "Save", command = "SaveFile" },
+  { key = "saveAs", label = "Save As", command = "SaveFileAs" },
+  { key = "saveAll", label = "Save All (extension command)", command = "SaveAll" },
+  { key = "export", label = "Export / Save Copy As", command = "SaveFileCopyAs" },
+  { key = "exportSpriteSheet", label = "Export Sprite Sheet", command = "ExportSpriteSheet" },
+  { key = "exportTileset", label = "Export Tileset", command = "ExportTileset" },
+  { key = "repeatLastExport", label = "Repeat Last Export", command = "RepeatLastExport" },
+  { key = "saveSelection", label = "Save Selection", command = "SaveMask" },
+  { key = "savePalette", label = "Save Palette", command = "SavePalette" }
 }
+
+local COMMAND_TO_TRIGGER = {}
+for _, trigger in ipairs(TRIGGERS) do
+  if trigger.command ~= "SaveAll" then
+    COMMAND_TO_TRIGGER[trigger.command] = trigger.key
+  end
+end
 
 local function normalizePreferences(plugin)
   local prefs = plugin.preferences
@@ -15,31 +30,33 @@ local function normalizePreferences(plugin)
     prefs.enabled = true
   end
 
-  if prefs.stopOnFailure == nil then
-    prefs.stopOnFailure = true
+  if type(prefs.scriptPath) ~= "string" then
+    prefs.scriptPath = ""
+  end
+
+  if type(prefs.scriptArguments) ~= "string" then
+    prefs.scriptArguments = ""
   end
 
   if prefs.runFromSpriteDirectory == nil then
     prefs.runFromSpriteDirectory = true
   end
 
-  if type(prefs.commands) ~= "table" or #prefs.commands == 0 then
-    prefs.commands = { DEFAULT_COMMAND }
+  if type(prefs.triggers) ~= "table" then
+    prefs.triggers = {}
   end
 
-  for i, item in ipairs(prefs.commands) do
-    if type(item) ~= "table" then
-      prefs.commands[i] = {
-        enabled = true,
-        command = tostring(item or "")
-      }
-    else
-      if item.enabled == nil then
-        item.enabled = true
-      end
-      if type(item.command) ~= "string" then
-        item.command = tostring(item.command or "")
-      end
+  -- Preserve the v0.1 behaviour on upgrade: Save + Save As enabled.
+  if prefs.triggers.save == nil then
+    prefs.triggers.save = true
+  end
+  if prefs.triggers.saveAs == nil then
+    prefs.triggers.saveAs = true
+  end
+
+  for _, trigger in ipairs(TRIGGERS) do
+    if prefs.triggers[trigger.key] == nil then
+      prefs.triggers[trigger.key] = false
     end
   end
 end
@@ -48,12 +65,9 @@ local function shellQuote(value)
   value = tostring(value or "")
 
   if app.os.windows then
-    -- Double quote is not a valid Windows filename character, so wrapping a
-    -- filesystem path is sufficient for the path variables exposed here.
     return '"' .. value .. '"'
   end
 
-  -- POSIX single-quote escaping: ' becomes '\''.
   return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
@@ -63,32 +77,75 @@ local function replaceToken(text, token, value)
   end)
 end
 
-local function expandCommand(command, sprite)
-  local file = sprite.filename
-  local dir = app.fs.filePath(file)
-  local name = app.fs.fileTitle(file)
-  local filename = app.fs.fileName(file)
-  local ext = app.fs.fileExtension(file)
+local function spriteContext(sprite)
+  local file = ""
+
+  if sprite ~= nil and sprite.isValid and sprite.filename ~= nil then
+    file = sprite.filename
+  end
+
+  return {
+    file = file,
+    dir = file ~= "" and app.fs.filePath(file) or "",
+    name = file ~= "" and app.fs.fileTitle(file) or "",
+    filename = file ~= "" and app.fs.fileName(file) or "",
+    ext = file ~= "" and app.fs.fileExtension(file) or ""
+  }
+end
+
+local function expandText(text, sprite, hookKey, commandName)
+  local ctx = spriteContext(sprite)
+  local hook = hookKey or "manual"
+  local command = commandName or "Manual"
 
   local replacements = {
-    ["{qfile}"] = shellQuote(file),
-    ["{qdir}"] = shellQuote(dir),
-    ["{qname}"] = shellQuote(name),
-    ["{qfilename}"] = shellQuote(filename),
-    ["{qext}"] = shellQuote(ext),
-    ["{file}"] = file,
-    ["{dir}"] = dir,
-    ["{name}"] = name,
-    ["{filename}"] = filename,
-    ["{ext}"] = ext
+    ["{qfile}"] = shellQuote(ctx.file),
+    ["{qdir}"] = shellQuote(ctx.dir),
+    ["{qname}"] = shellQuote(ctx.name),
+    ["{qfilename}"] = shellQuote(ctx.filename),
+    ["{qext}"] = shellQuote(ctx.ext),
+    ["{qhook}"] = shellQuote(hook),
+    ["{qcommand}"] = shellQuote(command),
+    ["{file}"] = ctx.file,
+    ["{dir}"] = ctx.dir,
+    ["{name}"] = ctx.name,
+    ["{filename}"] = ctx.filename,
+    ["{ext}"] = ctx.ext,
+    ["{hook}"] = hook,
+    ["{command}"] = command
   }
 
-  local expanded = command
+  local expanded = text or ""
   for token, value in pairs(replacements) do
     expanded = replaceToken(expanded, token, value)
   end
 
-  return expanded, dir
+  return expanded, ctx
+end
+
+local function scriptInvocation(scriptPath)
+  local ext = string.lower(app.fs.fileExtension(scriptPath) or "")
+  local quoted = shellQuote(scriptPath)
+
+  if app.os.windows then
+    if ext == "bat" or ext == "cmd" then
+      return "call " .. quoted
+    elseif ext == "ps1" then
+      return "powershell -NoProfile -ExecutionPolicy Bypass -File " .. quoted
+    elseif ext == "sh" or ext == "bash" or ext == "command" then
+      return "bash " .. quoted
+    end
+  else
+    if ext == "sh" or ext == "command" then
+      return "sh " .. quoted
+    elseif ext == "bash" then
+      return "bash " .. quoted
+    elseif ext == "ps1" then
+      return "pwsh -NoProfile -File " .. quoted
+    end
+  end
+
+  return quoted
 end
 
 local function withWorkingDirectory(command, dir, enabled)
@@ -123,7 +180,7 @@ end
 
 local function showFailure(command, reason, code)
   local details = {
-    "Command failed:",
+    "Script failed:",
     command
   }
 
@@ -137,194 +194,137 @@ local function showFailure(command, reason, code)
   end
 
   app.alert {
-    title = "Save Hooks",
+    title = "Save & Run",
     text = details
   }
 end
 
-local function runCommands(plugin, sprite, force, interactive)
+local function runScript(plugin, sprite, hookKey, commandName, interactive)
   normalizePreferences(plugin)
   local prefs = plugin.preferences
 
-  if not force and not prefs.enabled then
-    return true, 0
+  if running then
+    return false
   end
 
-  if sprite == nil or not sprite.isValid or not sprite.hasAssociatedFile then
+  if prefs.scriptPath == nil or not prefs.scriptPath:match("%S") then
     if interactive then
       app.alert {
-        title = "Save Hooks",
-        text = "Save the active sprite to a file before running save hooks."
+        title = "Save & Run",
+        text = "Choose a script in Settings first."
       }
     end
-    return false, 0
+    return false
   end
 
-  if running then
-    return false, 0
+  local args, ctx = expandText(prefs.scriptArguments or "", sprite, hookKey, commandName)
+  local command = scriptInvocation(prefs.scriptPath)
+
+  if args:match("%S") then
+    command = command .. " " .. args
   end
+
+  command = withWorkingDirectory(command, ctx.dir, prefs.runFromSpriteDirectory)
+
+  print("[Aseprite Save & Run] " .. tostring(commandName or "Manual") .. " > " .. command)
 
   running = true
-  local executed = 0
-  local overallSuccess = true
-
-  for _, item in ipairs(prefs.commands) do
-    local source = item.command or ""
-
-    if item.enabled ~= false and source:match("%S") then
-      local command, dir = expandCommand(source, sprite)
-      command = withWorkingDirectory(command, dir, prefs.runFromSpriteDirectory)
-
-      print("[Aseprite Save Hooks] > " .. command)
-      local success, reason, code = executeCommand(command)
-      executed = executed + 1
-
-      if not success then
-        overallSuccess = false
-        showFailure(command, reason, code)
-
-        if prefs.stopOnFailure then
-          break
-        end
-      end
-    end
-  end
-
+  local success, reason, code = executeCommand(command)
   running = false
 
-  if interactive and overallSuccess then
-    if executed == 0 then
-      app.alert {
-        title = "Save Hooks",
-        text = "No enabled commands are configured."
-      }
-    else
-      app.alert {
-        title = "Save Hooks",
-        text = "Executed " .. tostring(executed) .. " command(s)."
-      }
-    end
+  if not success then
+    showFailure(command, reason, code)
+    return false
   end
 
-  return overallSuccess, executed
+  if interactive then
+    app.alert {
+      title = "Save & Run",
+      text = "Script completed successfully."
+    }
+  end
+
+  return true
 end
 
-local function saveDialogState(dlg, plugin, count)
-  local prefs = plugin.preferences
+local function triggerEnabled(plugin, key)
+  normalizePreferences(plugin)
+  return plugin.preferences.enabled == true and plugin.preferences.triggers[key] == true
+end
+
+local function saveSettingsFromDialog(dlg, plugin)
   local data = dlg.data
-  local commands = {}
+  local prefs = plugin.preferences
 
   prefs.enabled = data.enabled ~= false
-  prefs.stopOnFailure = data.stop_on_failure ~= false
+  prefs.scriptPath = data.script_path or ""
+  prefs.scriptArguments = data.script_arguments or ""
   prefs.runFromSpriteDirectory = data.run_from_sprite_directory ~= false
 
-  for i = 1, count do
-    table.insert(commands, {
-      enabled = data["command_enabled_" .. tostring(i)] ~= false,
-      command = data["command_" .. tostring(i)] or ""
-    })
+  for _, trigger in ipairs(TRIGGERS) do
+    prefs.triggers[trigger.key] = data["trigger_" .. trigger.key] == true
   end
-
-  if #commands == 0 then
-    commands = { DEFAULT_COMMAND }
-  end
-
-  prefs.commands = commands
 end
 
 local function showSettings(plugin)
   normalizePreferences(plugin)
-
   local prefs = plugin.preferences
-  local commands = prefs.commands
-  local count = #commands
 
   local dlg = Dialog {
-    title = "Save Hooks",
+    title = "Save & Run Settings",
     resizeable = true
   }
 
   dlg:check {
     id = "enabled",
-    text = "Run hooks after Save / Save As",
+    text = "Enable automatic hooks",
     selected = prefs.enabled
+  }
+
+  dlg:file {
+    id = "script_path",
+    label = "Script:",
+    title = "Select shell script",
+    filename = prefs.scriptPath,
+    open = true,
+    entry = true
+  }
+
+  dlg:entry {
+    id = "script_arguments",
+    label = "Arguments:",
+    text = prefs.scriptArguments,
+    hexpand = true
   }
 
   dlg:check {
     id = "run_from_sprite_directory",
-    text = "Run commands from the sprite directory",
+    text = "Run from the active sprite directory",
     selected = prefs.runFromSpriteDirectory
   }
 
-  dlg:check {
-    id = "stop_on_failure",
-    text = "Stop after the first failed command",
-    selected = prefs.stopOnFailure
-  }
+  dlg:separator { text = "Run after" }
 
-  dlg:separator { text = "Commands" }
-
-  for i, item in ipairs(commands) do
-    local row = i
-
+  for _, trigger in ipairs(TRIGGERS) do
     dlg:check {
-      id = "command_enabled_" .. tostring(row),
-      label = tostring(row) .. ".",
-      text = "Enabled",
-      selected = item.enabled ~= false
+      id = "trigger_" .. trigger.key,
+      text = trigger.label,
+      selected = prefs.triggers[trigger.key] == true
     }
-
-    dlg:entry {
-      id = "command_" .. tostring(row),
-      text = item.command or "",
-      hexpand = true
-    }
-
-    dlg:button {
-      id = "remove_" .. tostring(row),
-      text = "Remove",
-      onclick = function()
-        saveDialogState(dlg, plugin, count)
-        table.remove(plugin.preferences.commands, row)
-
-        if #plugin.preferences.commands == 0 then
-          plugin.preferences.commands = { DEFAULT_COMMAND }
-        end
-
-        dlg:close()
-        showSettings(plugin)
-      end
-    }
-
-    dlg:newrow { always = true }
   end
 
-  dlg:button {
-    id = "add_command",
-    text = "+ Add command",
-    onclick = function()
-      saveDialogState(dlg, plugin, count)
-      table.insert(plugin.preferences.commands, {
-        enabled = true,
-        command = ""
-      })
-      dlg:close()
-      showSettings(plugin)
-    end
-  }
-
-  dlg:separator { text = "Variables" }
-  dlg:label { text = "{file} {dir} {name} {filename} {ext}" }
-  dlg:label { text = "Quoted: {qfile} {qdir} {qname} {qfilename} {qext}" }
+  dlg:separator { text = "Argument variables" }
+  dlg:label { text = "{file} {dir} {name} {filename} {ext} {hook} {command}" }
+  dlg:label { text = "Quoted forms: {qfile} {qdir} {qname} {qfilename} {qext} {qhook} {qcommand}" }
 
   dlg:separator()
 
   dlg:button {
     id = "run_now",
-    text = "Run Now",
+    text = "Run Script Now",
     onclick = function()
-      saveDialogState(dlg, plugin, count)
-      runCommands(plugin, app.activeSprite, true, true)
+      saveSettingsFromDialog(dlg, plugin)
+      runScript(plugin, app.sprite, "manual", "Manual", true)
     end
   }
 
@@ -333,7 +333,7 @@ local function showSettings(plugin)
     text = "Save",
     focus = true,
     onclick = function()
-      saveDialogState(dlg, plugin, count)
+      saveSettingsFromDialog(dlg, plugin)
       dlg:close()
     end
   }
@@ -349,47 +349,39 @@ local function showSettings(plugin)
   dlg:show { autoscrollbars = true }
 end
 
-local function recordSaveStart(ev)
-  if ev.name ~= "SaveFile" and ev.name ~= "SaveFileAs" then
+local function recordCommandStart(ev)
+  local hookKey = COMMAND_TO_TRIGGER[ev.name]
+  if hookKey == nil then
     return
   end
 
-  local sprite = app.activeSprite
-  if sprite == nil or not sprite.isValid then
-    pendingSave = nil
-    return
-  end
-
-  pendingSave = {
-    command = ev.name,
-    spriteId = sprite.id,
-    filename = sprite.filename,
-    hadAssociatedFile = sprite.hasAssociatedFile,
-    wasModified = sprite.isModified
+  local sprite = app.sprite
+  pendingCommand = {
+    name = ev.name,
+    hookKey = hookKey,
+    sprite = sprite,
+    spriteId = sprite ~= nil and sprite.id or nil,
+    filename = sprite ~= nil and sprite.filename or "",
+    hadAssociatedFile = sprite ~= nil and sprite.hasAssociatedFile or false,
+    wasModified = sprite ~= nil and sprite.isModified or false
   }
 end
 
-local function savedSuccessfully(ev, sprite)
+local function saveSucceeded(ev, sprite)
   if sprite == nil or not sprite.isValid or not sprite.hasAssociatedFile then
     return false
   end
 
-  -- A successful save leaves the document clean. This also prevents hooks
-  -- from firing after cancelling a save of a modified document.
   if sprite.isModified then
     return false
   end
 
-  if ev.name == "SaveFileAs" and pendingSave ~= nil and
-     pendingSave.command == "SaveFileAs" and
-     pendingSave.spriteId == sprite.id then
-    -- If an already-clean, already-associated document went through Save As
-    -- but its filename did not change, the file picker was most likely
-    -- cancelled. Skipping here avoids a false-positive hook run. Saving As to
-    -- the same exact path is the trade-off and can still be handled by Run Now.
-    if pendingSave.hadAssociatedFile and
-       not pendingSave.wasModified and
-       pendingSave.filename == sprite.filename then
+  if ev.name == "SaveFileAs" and pendingCommand ~= nil and
+     pendingCommand.name == "SaveFileAs" and
+     pendingCommand.spriteId == sprite.id then
+    if pendingCommand.hadAssociatedFile and
+       not pendingCommand.wasModified and
+       pendingCommand.filename == sprite.filename then
       return false
     end
   end
@@ -397,55 +389,133 @@ local function savedSuccessfully(ev, sprite)
   return true
 end
 
-local function handleSaveFinished(plugin, ev)
-  if ev.name ~= "SaveFile" and ev.name ~= "SaveFileAs" then
+local function handleCommandFinished(plugin, ev)
+  if suppressHooks or running then
     return
   end
 
-  local sprite = app.activeSprite
-  local shouldRun = savedSuccessfully(ev, sprite)
-  pendingSave = nil
-
-  if shouldRun then
-    runCommands(plugin, sprite, false, false)
+  local hookKey = COMMAND_TO_TRIGGER[ev.name]
+  if hookKey == nil then
+    return
   end
+
+  local sprite = app.sprite
+  if pendingCommand ~= nil and pendingCommand.name == ev.name and
+     pendingCommand.sprite ~= nil and pendingCommand.sprite.isValid then
+    sprite = pendingCommand.sprite
+  end
+
+  if ev.name == "SaveFile" or ev.name == "SaveFileAs" then
+    local succeeded = saveSucceeded(ev, sprite)
+    pendingCommand = nil
+
+    if succeeded and triggerEnabled(plugin, hookKey) then
+      runScript(plugin, sprite, hookKey, ev.name, false)
+    end
+    return
+  end
+
+  pendingCommand = nil
+
+  -- Export-style commands do not expose a success/cancel result through the
+  -- aftercommand event. Run after the command returns when that hook is enabled.
+  if triggerEnabled(plugin, hookKey) then
+    runScript(plugin, sprite, hookKey, ev.name, false)
+  end
+end
+
+local function saveAll(plugin)
+  normalizePreferences(plugin)
+
+  local saved = 0
+  local skipped = 0
+  local failed = 0
+  local contextSprite = app.sprite
+
+  suppressHooks = true
+
+  for _, sprite in ipairs(app.sprites) do
+    if sprite.isValid and sprite.isModified then
+      if sprite.hasAssociatedFile and sprite.filename ~= "" then
+        local callOk, result = pcall(function()
+          return sprite:saveAs(sprite.filename)
+        end)
+
+        if callOk and result ~= false then
+          saved = saved + 1
+          contextSprite = sprite
+        else
+          failed = failed + 1
+        end
+      else
+        skipped = skipped + 1
+      end
+    end
+  end
+
+  suppressHooks = false
+
+  if triggerEnabled(plugin, "saveAll") then
+    runScript(plugin, contextSprite, "saveAll", "SaveAll", false)
+  end
+
+  local summary = { "Saved " .. tostring(saved) .. " modified file(s)." }
+  if skipped > 0 then
+    table.insert(summary, tostring(skipped) .. " unsaved file(s) were skipped; use Save As first.")
+  end
+  if failed > 0 then
+    table.insert(summary, tostring(failed) .. " file(s) could not be saved.")
+  end
+
+  app.alert {
+    title = "Save All",
+    text = summary
+  }
 end
 
 function init(plugin)
   normalizePreferences(plugin)
 
   plugin:newMenuGroup {
-    id = "aseprite_save_hooks_menu",
-    title = "Save Hooks",
+    id = "aseprite_save_and_menu",
+    title = "Save & Run",
     group = "file_scripts"
   }
 
   plugin:newCommand {
-    id = "AsepriteSaveHooksSettings",
+    id = "AsepriteSaveAndSettings",
     title = "Settings...",
-    group = "aseprite_save_hooks_menu",
+    group = "aseprite_save_and_menu",
     onclick = function()
       showSettings(plugin)
     end
   }
 
   plugin:newCommand {
-    id = "AsepriteSaveHooksRunNow",
-    title = "Run Now",
-    group = "aseprite_save_hooks_menu",
+    id = "AsepriteSaveAndRunNow",
+    title = "Run Script Now",
+    group = "aseprite_save_and_menu",
     onclick = function()
-      runCommands(plugin, app.activeSprite, true, true)
-    end,
-    onenabled = function()
-      local sprite = app.activeSprite
-      return sprite ~= nil and sprite.isValid and sprite.hasAssociatedFile
+      runScript(plugin, app.sprite, "manual", "Manual", true)
     end
   }
 
   plugin:newCommand {
-    id = "AsepriteSaveHooksEnabled",
-    title = "Enabled",
-    group = "aseprite_save_hooks_menu",
+    id = "AsepriteSaveAndSaveAll",
+    title = "Save All",
+    group = "aseprite_save_and_menu",
+    onclick = function()
+      saveAll(plugin)
+    end,
+    onenabled = function()
+      return #app.sprites > 0
+    end
+  }
+
+  plugin:newCommand {
+    id = "AsepriteSaveAndEnabled",
+    title = "Automatic Hooks Enabled",
+    group = "aseprite_save_and_menu",
     onclick = function()
       plugin.preferences.enabled = not plugin.preferences.enabled
     end,
@@ -454,24 +524,20 @@ function init(plugin)
     end
   }
 
-  beforeSaveListener = app.events:on("beforecommand", recordSaveStart)
-
-  saveListener = app.events:on("aftercommand", function(ev)
-    if running then
-      return
-    end
-    handleSaveFinished(plugin, ev)
+  beforeCommandListener = app.events:on("beforecommand", recordCommandStart)
+  afterCommandListener = app.events:on("aftercommand", function(ev)
+    handleCommandFinished(plugin, ev)
   end)
 end
 
 function exit(plugin)
-  if beforeSaveListener ~= nil then
-    app.events:off(beforeSaveListener)
-    beforeSaveListener = nil
+  if beforeCommandListener ~= nil then
+    app.events:off(beforeCommandListener)
+    beforeCommandListener = nil
   end
 
-  if saveListener ~= nil then
-    app.events:off(saveListener)
-    saveListener = nil
+  if afterCommandListener ~= nil then
+    app.events:off(afterCommandListener)
+    afterCommandListener = nil
   end
 end
