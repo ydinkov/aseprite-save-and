@@ -22,10 +22,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Lua
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y lua5.4 zip
+          sudo apt-get install -y lua5.4 zip jq
 
       - name: Validate manifest
         run: |
@@ -48,31 +48,48 @@ jobs:
           fi
 
       - name: Build extension
+        id: package
         shell: bash
         run: |
+          version="$(jq -r '.version' package.json)"
+          asset="aseprite-save-and-${version}.aseprite-extension"
+
           mkdir -p dist/package
           cp package.json save-hooks.lua LICENSE dist/package/
 
           (
             cd dist/package
-            zip -r ../aseprite-save-hooks.aseprite-extension package.json save-hooks.lua LICENSE
+            zip -r "../${asset}" package.json save-hooks.lua LICENSE
           )
 
           rm -rf dist/package
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload build artifact
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aseprite-save-hooks
-          path: dist/aseprite-save-hooks.aseprite-extension
+          name: aseprite-save-and-${{ github.sha }}
+          path: dist/${{ steps.package.outputs.asset }}
           if-no-files-found: error
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/aseprite-save-hooks.aseprite-extension \
-            --title "Aseprite Save Hooks $GITHUB_REF_NAME" \
-            --generate-notes
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "Aseprite Save & Run $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+      - name: Upload extension to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/${{ steps.package.outputs.asset }}" \
+            --clobber
