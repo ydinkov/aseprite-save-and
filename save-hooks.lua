@@ -46,7 +46,7 @@ local function normalizePreferences(plugin)
     prefs.triggers = {}
   end
 
-  -- Preserve the v0.1 behaviour on upgrade: Save + Save As enabled.
+  -- Preserve the original behaviour on upgrade: Save + Save As enabled.
   if prefs.triggers.save == nil then
     prefs.triggers.save = true
   end
@@ -65,6 +65,8 @@ local function shellQuote(value)
   value = tostring(value or "")
 
   if app.os.windows then
+    -- Windows filenames cannot contain a double quote. The complete command
+    -- gets an additional pair of quotes immediately before os.execute().
     return '"' .. value .. '"'
   end
 
@@ -131,7 +133,7 @@ local function scriptInvocation(scriptPath)
     if ext == "bat" or ext == "cmd" then
       return "call " .. quoted
     elseif ext == "ps1" then
-      return "powershell -NoProfile -ExecutionPolicy Bypass -File " .. quoted
+      return "powershell.exe -NoProfile -ExecutionPolicy Bypass -File " .. quoted
     elseif ext == "sh" or ext == "bash" or ext == "command" then
       return "bash " .. quoted
     end
@@ -160,29 +162,52 @@ local function withWorkingDirectory(command, dir, enabled)
   return "cd " .. shellQuote(dir) .. " && " .. command
 end
 
+local function commandForOsExecute(command)
+  if app.os.windows then
+    -- Aseprite's os.execute() ultimately goes through the Windows command
+    -- processor. If any part of the command contains quoted paths, cmd.exe can
+    -- consume the first quote as its own wrapper and misparse the rest. An
+    -- extra outer pair of quotes makes the complete command one /C payload.
+    return '"' .. command .. '"'
+  end
+
+  return command
+end
+
 local function executeCommand(command)
-  local callOk, result, reason, code = pcall(os.execute, command)
+  local shellCommand = commandForOsExecute(command)
+  print("[Aseprite Save & Run] shell > " .. shellCommand)
+
+  local callOk, result, reason, code = pcall(os.execute, shellCommand)
 
   if not callOk then
-    return false, tostring(result), nil
+    return false, tostring(result), nil, shellCommand
   end
 
   if result == true then
-    return true, reason, code or 0
+    return true, reason, code or 0, shellCommand
   end
 
   if type(result) == "number" then
-    return result == 0, reason, result
+    return result == 0, reason, result, shellCommand
   end
 
-  return false, reason, code
+  return false, reason, code, shellCommand
 end
 
-local function showFailure(command, reason, code)
+local function showFailure(command, shellCommand, reason, code)
   local details = {
-    "Script failed:",
+    "Script failed.",
+    "",
+    "Command:",
     command
   }
+
+  if shellCommand ~= nil and shellCommand ~= command then
+    table.insert(details, "")
+    table.insert(details, "Windows shell command:")
+    table.insert(details, shellCommand)
+  end
 
   if reason ~= nil then
     table.insert(details, "")
@@ -217,6 +242,19 @@ local function runScript(plugin, sprite, hookKey, commandName, interactive)
     return false
   end
 
+  if not app.fs.isFile(prefs.scriptPath) then
+    app.alert {
+      title = "Save & Run",
+      text = {
+        "The configured script does not exist:",
+        prefs.scriptPath,
+        "",
+        "Open Settings and select the script again."
+      }
+    }
+    return false
+  end
+
   local args, ctx = expandText(prefs.scriptArguments or "", sprite, hookKey, commandName)
   local command = scriptInvocation(prefs.scriptPath)
 
@@ -229,11 +267,11 @@ local function runScript(plugin, sprite, hookKey, commandName, interactive)
   print("[Aseprite Save & Run] " .. tostring(commandName or "Manual") .. " > " .. command)
 
   running = true
-  local success, reason, code = executeCommand(command)
+  local success, reason, code, shellCommand = executeCommand(command)
   running = false
 
   if not success then
-    showFailure(command, reason, code)
+    showFailure(command, shellCommand, reason, code)
     return false
   end
 
