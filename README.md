@@ -20,7 +20,7 @@ An Aseprite extension that runs a shell script after configurable save and expor
 - Optionally run the script with the active sprite directory as the working directory.
 - Use sprite and hook variables in the script arguments.
 - Build an installable `.aseprite-extension` package in GitHub Actions.
-- Publish the package as a GitHub Release asset for `v*` tags.
+- Automatically publish each new `package.json` version as a GitHub Release with the installable extension attached.
 
 ## Install
 
@@ -89,18 +89,15 @@ LICENSE
 .github/workflows/release.yml
 ```
 
-The GitHub Actions workflow validates the manifest, syntax-checks the Lua source, and builds the extension on pushes and pull requests.
+The GitHub Actions workflow validates the manifest, syntax-checks the Lua source, builds the extension, and uploads the package as a workflow artifact on pushes and pull requests.
 
 ## Release
 
-Update the version in `package.json`, then push a matching tag:
+The version in `package.json` is the release version. When a push to `main` succeeds, the workflow checks for `v<version>`. If that release does not exist, it creates the tag and GitHub Release from that commit and attaches the built `.aseprite-extension` file.
 
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
+To publish another version, update `package.json`, for example from `0.2.0` to `0.3.0`, and merge/push that change to `main`. Existing releases are left unchanged.
 
-The workflow verifies the tag matches `package.json`, builds the extension, creates the GitHub Release if needed, and uploads the `.aseprite-extension` file as a release asset.
+You can still push a matching `v*` tag or run the workflow manually; the same package-version validation and publishing logic applies.
 
 ## License
 
