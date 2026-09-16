@@ -1,0 +1,22 @@
+{
+  "name": "aseprite-save-hooks",
+  "displayName": "Aseprite Save Hooks",
+  "description": "Run configurable terminal commands automatically after saving a sprite in Aseprite.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Yasen Dinkov",
+    "url": "https://github.com/ydinkov"
+  },
+  "publisher": "ydinkov",
+  "license": "MIT",
+  "categories": [
+    "Scripts"
+  ],
+  "contributes": {
+    "scripts": [
+      {
+        "path": "./save-hooks.lua"
+      }
+    ]
+  }
+}
