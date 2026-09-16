@@ -1,0 +1,78 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Lua
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 zip
+
+      - name: Validate manifest
+        run: |
+          jq empty package.json
+          test "$(jq -r '.contributes.scripts[0].path' package.json)" = "./save-hooks.lua"
+
+      - name: Validate Lua syntax
+        run: luac5.4 -p save-hooks.lua
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(jq -r '.version' package.json)"
+
+          if [ "$tag_version" != "$package_version" ]; then
+            echo "Tag version ($tag_version) does not match package.json version ($package_version)." >&2
+            exit 1
+          fi
+
+      - name: Build extension
+        shell: bash
+        run: |
+          mkdir -p dist/package
+          cp package.json save-hooks.lua LICENSE dist/package/
+
+          (
+            cd dist/package
+            zip -r ../aseprite-save-hooks.aseprite-extension package.json save-hooks.lua LICENSE
+          )
+
+          rm -rf dist/package
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-save-hooks
+          path: dist/aseprite-save-hooks.aseprite-extension
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/aseprite-save-hooks.aseprite-extension \
+            --title "Aseprite Save Hooks $GITHUB_REF_NAME" \
+            --generate-notes
